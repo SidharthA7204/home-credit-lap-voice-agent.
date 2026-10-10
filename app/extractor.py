@@ -1678,6 +1678,7 @@ Return only the final JSON object."""
 class GroqExtractor(BaseExtractor):
     def __init__(self, api_key: str, model: str, fallback: BaseExtractor | None = None):
         from groq import AsyncGroq
+
         from .interpretation import AIInterpreter
 
         self.client = AsyncGroq(api_key=api_key, timeout=8.0, max_retries=1)

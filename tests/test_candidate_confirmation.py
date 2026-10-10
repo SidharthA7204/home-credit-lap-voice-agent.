@@ -49,7 +49,7 @@ async def test_yes_accepts_candidate():
         Extraction.model_validate({"confirm": True})
     ])
 
-    result = await engine.handle("Yes")
+    await engine.handle("Yes")
 
     assert engine.pending_confirmation is None
     assert engine.state.property_type == "residential"
@@ -63,7 +63,7 @@ async def test_no_discards_candidate_and_reasks_original_question():
         Extraction.model_validate({"confirm": False})
     ])
 
-    result = await engine.handle("No")
+    await engine.handle("No")
 
     assert engine.pending_confirmation is None
     assert engine.state.property_type is None
