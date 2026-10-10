@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 
+import pytest
 from dotenv import load_dotenv
 
 from app.interpretation import AIInterpreter
@@ -11,11 +12,14 @@ load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = os.getenv("MODEL_NAME", "openai/gpt-oss-20b")
 
-if not API_KEY:
-    raise RuntimeError("GROQ_API_KEY was not found in your .env file")
-
 
 async def main():
+    if not API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY was not found. Add it to your local .env file "
+            "before running this manual integration test."
+        )
+
     interpreter = AIInterpreter(
         api_key=API_KEY,
         model=MODEL,
@@ -67,13 +71,26 @@ async def main():
             language="en",
         )
 
-        print(json.dumps({
-            "status": result.status,
-            "candidate_value": result.candidate_value,
-            "candidate_display": result.candidate_display,
-            "alternatives": result.alternatives,
-            "reason": result.reason,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "status": result.status,
+                    "candidate_value": result.candidate_value,
+                    "candidate_display": result.candidate_display,
+                    "alternatives": result.alternatives,
+                    "reason": result.reason,
+                },
+                indent=2,
+            )
+        )
+
+
+@pytest.mark.skipif(
+    not API_KEY,
+    reason="Manual Groq integration test requires GROQ_API_KEY",
+)
+def test_manual_interpreter_integration():
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
