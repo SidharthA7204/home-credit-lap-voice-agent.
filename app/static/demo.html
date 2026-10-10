@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Home Credit LAP Voice Agent — Demo</title>
+<style>
+ body{font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px;background:#f6f7f9;color:#1b1f24}
+ #log{background:#fff;border:1px solid #d8dde3;border-radius:10px;padding:12px;height:360px;overflow:auto}
+ .a{color:#0b5cab;margin:6px 0}.u{color:#222;margin:6px 0;text-align:right}
+ button,select,input{font-size:15px;padding:8px 12px;border-radius:8px;border:1px solid #bbb}
+ button{background:#0b5cab;color:#fff;border:0;cursor:pointer}.row{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}
+ pre{background:#fff;border:1px solid #d8dde3;border-radius:10px;padding:10px;font-size:12px;overflow:auto}
+</style></head><body>
+<h2>Home Credit — LAP Voice Agent</h2>
+<div class="row">
+ <input id="name" value="Rahul Sharma"><select id="lang"><option value="en">English</option><option value="hi">Hindi</option></select>
+ <select id="gender"><option>female</option><option>male</option></select><button id="start">Start call</button>
+</div>
+<div id="log"></div>
+<div class="row"><button id="mic">🎤 Speak</button><input id="txt" placeholder="…or type" style="flex:1"><button id="send">Send</button></div>
+<pre id="state">{}</pre>
+<script>
+let sid=null,ended=false;const $=id=>document.getElementById(id);
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+function add(c,t){const d=document.createElement('div');d.className=c;d.textContent=(c=='a'?'Agent: ':'You: ')+t;$('log').appendChild(d);$('log').scrollTop=1e9}
+function speak(t){if(!window.speechSynthesis)return;const u=new SpeechSynthesisUtterance(t);u.lang=$('lang').value=='hi'?'hi-IN':'en-IN';speechSynthesis.cancel();speechSynthesis.speak(u)}
+$('start').onclick=async()=>{$('log').innerHTML='';ended=false;
+ const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer_name:$('name').value,language:$('lang').value,agent_gender:$('gender').value,current_time:new Date().toTimeString().slice(0,5)})});
+ const j=await r.json();sid=j.session_id;add('a',j.reply);speak(j.reply)};
+async function send(t){if(!sid||ended||!t.trim())return;add('u',t);
+ const r=await fetch(`/api/sessions/${sid}/turn`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({utterance:t})});
+ const j=await r.json();add('a',j.reply);speak(j.reply);ended=j.ended;$('state').textContent=JSON.stringify(j.state,null,2)}
+$('send').onclick=()=>{send($('txt').value);$('txt').value=''};$('txt').onkeydown=e=>{if(e.key=='Enter')$('send').click()};
+$('mic').onclick=()=>{if(!SR)return alert('Speech recognition needs Chrome/Edge');const r=new SR();r.lang=$('lang').value=='hi'?'hi-IN':'en-IN';r.onresult=e=>send(e.results[0][0].transcript);r.start()};
+</script></body></html>
