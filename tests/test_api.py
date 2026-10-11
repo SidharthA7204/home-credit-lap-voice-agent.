@@ -11,7 +11,7 @@ def test_health():
 
 def test_rest_flow_disqualifies_agricultural():
     sid = client.post("/api/sessions", json={"customer_name": "Rahul Sharma"}).json()["session_id"]
-    for u in ["Yes speaking", "Sure", "It's agricultural land"]:
+    for u in ["Yes speaking", "Sure", "It's agricultural land", "Yes"]:
         r = client.post(f"/api/sessions/{sid}/turn", json={"utterance": u}).json()
     assert r["ended"] and r["outcome"] == "disqualified"
 

@@ -54,7 +54,7 @@ class DialogEngine:
         self.last_reply = ""
         self._ack_n = 0
         self.pending_confirmation: dict[str, str | float | bool] | None = None
-
+        self.pending_answers: list[dict[str, str | float | bool]] = []
     # ------------------------------------------------------------------ helpers
     def _say(self, key: str, **kw) -> str:
         c = self.ctx
@@ -104,6 +104,7 @@ class DialogEngine:
         # Process high-priority requests before candidate confirmation.
         if ex.do_not_call:
             self.pending_confirmation = None
+            self.pending_answers.clear()
             return self._end(
                 Outcome.DO_NOT_CALL,
                 "do_not_call",
@@ -112,45 +113,286 @@ class DialogEngine:
 
         if ex.human_requested:
             self.pending_confirmation = None
+            self.pending_answers.clear()
             return self._end(
                 Outcome.HUMAN_CALLBACK,
                 "human_requested",
                 "human",
             )
 
-        # A pending interpretation must be confirmed before it changes qualification state.
+        # Existing loan / EMI reduction overrides qualification confirmation.
+        if ex.existing_loan is True:
+            self.pending_confirmation = None
+            self.pending_answers.clear()
+            self.state.existing_loan_mentioned = True
+            return self._end(
+                Outcome.TRANSFER,
+                "existing_loan",
+                "transfer",
+            )
+
+        # Refusal of the capped offer must override the previous
+        # loan-amount candidate confirmation.
+        if s.stage == Stage.CONFIRM_MAX and ex.confirm is False:
+            self.pending_confirmation = None
+            self.pending_answers.clear()
+            return self._end(
+                Outcome.DISQUALIFIED,
+                "declined_max_amount",
+                "max_declined",
+            )
+
+        # Reject a refused out-of-range tenure correction even when
+        # no candidate confirmation is currently pending.
+        if (
+            s.stage == Stage.FIX_TENURE
+            and ex.confirm is False
+            and ex.tenure_years is not None
+            and not (3 <= ex.tenure_years <= 15)
+        ):
+            self.pending_confirmation = None
+            self.pending_answers.clear()
+            return self._end(
+                Outcome.DISQUALIFIED,
+                "tenure_outside_range_refused",
+                "disqualified",
+            )
+
+        qualification_fields = (
+            "property_type",
+            "ownership",
+            "documents_available",
+            "loan_amount_lakh",
+            "occupation",
+            "income_mode",
+            "market_value_lakh",
+            "tenure_years",
+        )
+
+        # While a value is awaiting confirmation, collect other extracted
+        # qualification facts without saving them before their own confirmation.
         if self.pending_confirmation is not None:
-            if ex.confirm is True:
-                pending = self.pending_confirmation
+            pending = self.pending_confirmation
+
+            # Rejecting the out-of-range tenure correction ends qualification.
+            if (
+                ex.confirm is False
+                and s.stage == Stage.FIX_TENURE
+                and pending.get("field") == "tenure_years"
+            ):
                 self.pending_confirmation = None
+                self.pending_answers.clear()
+                return self._end(
+                    Outcome.DISQUALIFIED,
+                    "tenure_outside_range_refused",
+                    "disqualified",
+                )
+
+            additional_answers: list[dict[str, str | float | bool]] = []
+
+            if ex.candidate_field in qualification_fields and ex.candidate_value is not None:
+                additional_answers.append({
+                    "field": ex.candidate_field,
+                    "value": ex.candidate_value,
+                    "display": ex.candidate_display or self._confirmation_display(
+                        ex.candidate_field, ex.candidate_value
+                    ),
+                })
+
+            for answer_field in qualification_fields:
+                answer_value = getattr(ex, answer_field, None)
+                if answer_value is not None:
+                    additional_answers.append({
+                        "field": answer_field,
+                        "value": answer_value,
+                        "display": self._confirmation_display(answer_field, answer_value),
+                    })
+
+            for answer in additional_answers:
+                duplicate_current = (
+                    answer["field"] == pending["field"]
+                    and answer["value"] == pending["value"]
+                )
+
+                if duplicate_current:
+                    continue
+
+                # A newer explicit answer replaces an older queued answer
+                # for the same field. It remains unconfirmed and unsaved.
+                existing_index = next(
+                    (
+                        index
+                        for index, item in enumerate(self.pending_answers)
+                        if item["field"] == answer["field"]
+                    ),
+                    None,
+                )
+
+                if existing_index is None:
+                    self.pending_answers.append(answer)
+                else:
+                    self.pending_answers[existing_index] = answer
+
+            # Remove extracted qualification values so only an explicitly
+            # confirmed value can be passed into the state machine.
+            ex_data = ex.model_dump()
+            for answer_field in qualification_fields:
+                ex_data[answer_field] = None
+            ex_data.update({
+                "candidate_field": None,
+                "candidate_value": None,
+                "candidate_display": None,
+            })
+            ex = Extraction.model_validate(ex_data)
+
+            if ex.confirm is True:
                 field = str(pending["field"])
                 value = pending["value"]
-                try:
-                    ex = Extraction.model_validate({**ex.model_dump(), field: value,
-                        "candidate_field": None, "candidate_value": None, "candidate_display": None})
-                except Exception:
-                    log.exception("Could not apply confirmed candidate field=%s", field)
-                    return self._ask([self._say("sorry"), self._question_for(field)], field)
-                side = await self._side_answer(ex)
-                return self._step(ex, side, utterance)
-            if ex.confirm is False:
-                field = str(self.pending_confirmation["field"])
                 self.pending_confirmation = None
-                return self._ask(["No problem.", self._question_for(field)], field)
-            # If the answer is neither a clear yes nor no, do not lose the candidate.
-            return self._ask(["I may have misunderstood. Please say yes or no: did you mean "
-                              + str(self.pending_confirmation["display"]) + "?"], "confirm_candidate")
 
-        # The extractor can propose a best interpretation of noisy speech. Never save it
-        # until the customer confirms it. Do not start confirmation for clear facts.
-        if ex.candidate_field and ex.candidate_value is not None:
-            field = ex.candidate_field
-            value = ex.candidate_value
-            display = ex.candidate_display or str(value)
-            if field in {"property_type", "ownership", "documents_available", "loan_amount_lakh",
-                         "occupation", "income_mode", "market_value_lakh", "tenure_years"}:
-                self.pending_confirmation = {"field": field, "value": value, "display": display}
-                return self._ask([f"I heard {display}. Is that correct?"], "confirm_candidate")
+                ex_data = ex.model_dump()
+                ex_data[field] = value
+                ex = Extraction.model_validate(ex_data)
+
+                side = await self._side_answer(ex)
+                result = self._step(ex, side, utterance)
+
+                if result.ended:
+                    self.pending_answers.clear()
+                    return result
+
+                # If a queued answer is next, suppress the intermediate
+                # response from _step so this turn has only one agent reply.
+                if self.pending_answers:
+                    if self.transcript and self.transcript[-1] == ("agent", result.reply):
+                        self.transcript.pop()
+
+                    next_answer = self.pending_answers.pop(0)
+                    self.pending_confirmation = next_answer
+                    return self._ask([
+                        f"Just to confirm, {next_answer['display']}. Is that correct?"
+                    ], "confirm_candidate")
+
+                return result
+
+            if (
+                ex.confirm is False
+                and self.state.stage == Stage.FIX_TENURE
+                and pending["field"] == "tenure_years"
+            ):
+                self.pending_confirmation = None
+                self.pending_answers.clear()
+                return self._end(
+                    Outcome.DISQUALIFIED,
+                    "tenure_outside_range_refused",
+                    "disqualified",
+                )
+
+            if ex.confirm is False:
+                rejected_field = str(pending["field"])
+                self.pending_confirmation = None
+
+                # A rejected value is discarded. Resume the queue first so
+                # previously captured facts are not silently stranded.
+                if self.pending_answers:
+                    next_answer = self.pending_answers.pop(0)
+                    self.pending_confirmation = next_answer
+                    return self._ask([
+                        "No problem.",
+                        f"Just to confirm, {next_answer['display']}. Is that correct?"
+                    ], "confirm_candidate")
+
+                return self._ask(
+                    ["No problem.", self._question_for(rejected_field)],
+                    rejected_field,
+                )
+
+            # Keep the current confirmation active. Any additional
+            # qualification answers remain queued until this answer is resolved.
+            return self._ask([
+                "I may have misunderstood. Please say yes or no: "
+                f"did you mean {pending['display']}?"
+            ], "confirm_candidate")
+
+        # Every qualification answer must be confirmed before it is saved.
+        qualification_fields = (
+            "property_type",
+            "ownership",
+            "documents_available",
+            "loan_amount_lakh",
+            "occupation",
+            "income_mode",
+            "market_value_lakh",
+            "tenure_years",
+        )
+
+        # Confirm every qualification fact, queuing any additional facts
+        # extracted from the same utterance so none are silently discarded.
+        qualification_fields = (
+            "property_type",
+            "ownership",
+            "documents_available",
+            "loan_amount_lakh",
+            "occupation",
+            "income_mode",
+            "market_value_lakh",
+            "tenure_years",
+        )
+
+        answers: list[dict[str, str | float | bool]] = []
+
+        # Put an interpretation candidate first because it may need
+        # explicit ASR clarification before ordinary extracted facts.
+        field = ex.candidate_field
+        value = ex.candidate_value
+        if field in qualification_fields and value is not None:
+            answers.append({
+                "field": field,
+                "value": value,
+                "display": ex.candidate_display or self._confirmation_display(
+                    field, value
+                ),
+            })
+
+        for answer_field in qualification_fields:
+            answer_value = getattr(ex, answer_field, None)
+            if answer_value is None:
+                continue
+
+            # A candidate takes precedence over the ordinary value for
+            # that same field in this utterance.
+            if answers and answers[0]["field"] == answer_field:
+                continue
+
+            answers.append({
+                "field": answer_field,
+                "value": answer_value,
+                "display": self._confirmation_display(
+                    answer_field, answer_value
+                ),
+            })
+
+        if answers:
+            first = answers.pop(0)
+
+            # Preserve remaining answers for sequential confirmation.
+            for answer in answers:
+                duplicate_current = (
+                    answer["field"] == first["field"]
+                    and answer["value"] == first["value"]
+                )
+                duplicate_queued = any(
+                    item["field"] == answer["field"]
+                    for item in self.pending_answers
+                )
+                if not duplicate_current and not duplicate_queued:
+                    self.pending_answers.append(answer)
+
+            self.pending_confirmation = first
+            return self._ask(
+                [f"Just to confirm, {first['display']}. Is that correct?"],
+                "confirm_candidate",
+            )
 
         side = await self._side_answer(ex)
         return self._step(ex, side, utterance)
@@ -158,9 +400,56 @@ class DialogEngine:
     def _question_for(self, field: str) -> str:
         """Return the original field question after a rejected prediction."""
         if field in {"property_type", "ownership", "documents_available", "loan_amount_lakh",
-                     "occupation", "income_mode", "market_value_lakh", "tenure_years"}:
+                    "occupation", "income_mode", "market_value_lakh", "tenure_years"}:
             return self._say("q_" + field)
         return self._say("sorry")
+
+    def _confirmation_display(self, field: str, value: str | float | bool) -> str:
+        """Create a customer-friendly description of a qualification answer."""
+        value = getattr(value, "value", value)
+
+        if field == "property_type":
+            return f"your property is {value}"
+
+        if field == "ownership":
+            descriptions = {
+                "sole": "the property is solely in your name",
+                "joint": "the property is jointly owned",
+            }
+            return descriptions.get(str(value), f"ownership is {value}")
+
+        if field == "documents_available":
+            description = (
+                "the original property documents are available"
+                if value is True
+                else "the original property documents are not available"
+            )
+            return description
+
+        if field == "loan_amount_lakh":
+            return f"you would like to borrow {value} lakh rupees"
+
+        if field == "occupation":
+            descriptions = {
+                "salaried": "you are salaried",
+                "self_employed": "you are self-employed",
+            }
+            return descriptions.get(str(value), f"your occupation is {value}")
+
+        if field == "income_mode":
+            descriptions = {
+                "bank": "your income is received in your bank account",
+                "cash": "your income is received in cash",
+            }
+            return descriptions.get(str(value), f"your income mode is {value}")
+
+        if field == "market_value_lakh":
+            return f"the property's market value is approximately {value} lakh rupees"
+
+        if field == "tenure_years":
+            return f"you prefer a repayment period of {value} years"
+
+        return str(value)
 
     async def _side_answer(self, ex: Extraction) -> str | None:
         if ex.asks_rate:

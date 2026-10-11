@@ -24,9 +24,14 @@ def check(sc: Scenario, eng, last) -> list[str]:
     rec = eng.state.to_record()
     if rec["call_outcome"] != sc.outcome:
         errs.append(f"outcome {rec['call_outcome']!r} != {sc.outcome!r}")
+    state_key_aliases = {
+        "documents_available": "original_documents",
+    }
     for k, v in sc.state.items():
-        if rec.get(k) != v:
-            errs.append(f"{k}: {rec.get(k)!r} != {v!r}")
+        record_key = state_key_aliases.get(k, k)
+        actual = rec.get(record_key)
+        if actual != v:
+            errs.append(f"{k}: {actual!r} != {v!r}")
     reply = last.reply if last else ""
     for s in sc.reply_contains:
         if s.lower() not in reply.lower():

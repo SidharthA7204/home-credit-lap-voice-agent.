@@ -114,3 +114,111 @@ async def test_human_request_overrides_pending_confirmation():
     assert result.ended is True
     assert result.outcome.value == "human_callback"
     assert engine.pending_confirmation is None
+
+@pytest.mark.asyncio
+async def test_clear_qualification_answer_requires_confirmation():
+    """A clear answer must not be saved before explicit confirmation."""
+
+    engine = DialogEngine(
+        extractor=FakeExtractor([
+            Extraction.model_validate({
+                "property_type": "residential",
+            }),
+        ]),
+        ctx=CallContext(customer_name="Test Customer"),
+    )
+
+    engine.state.stage = Stage.QUALIFY
+    engine.asked_field = "property_type"
+
+    result = await engine.handle("Residential")
+
+    assert engine.state.property_type is None
+    assert engine.pending_confirmation is not None
+    assert engine.pending_confirmation["field"] == "property_type"
+    assert engine.pending_confirmation["value"] == "residential"
+    assert engine.asked_field == "confirm_candidate"
+    assert "correct" in result.reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_confirming_candidate_prompts_next_queued_answer_once():
+    """Confirm the current value, then ask once to confirm a queued value."""
+    engine = make_engine([
+        Extraction.model_validate({
+            "confirm": True,
+            "ownership": "sole",
+        }),
+    ])
+
+    previous_agent_replies = sum(
+        role == "agent" for role, _ in engine.transcript
+    )
+
+    result = await engine.handle("Yes, and the property is solely mine")
+
+    assert engine.state.property_type == "residential"
+    assert engine.state.ownership is None
+    assert engine.pending_confirmation is not None
+    assert engine.pending_confirmation["field"] == "ownership"
+    assert engine.asked_field == "confirm_candidate"
+    assert "solely in your name" in result.reply.lower()
+
+    current_agent_replies = sum(
+        role == "agent" for role, _ in engine.transcript
+    )
+    assert current_agent_replies - previous_agent_replies == 1
+
+
+@pytest.mark.asyncio
+async def test_new_answer_is_queued_without_saving_before_confirmation():
+    """A new answer during confirmation must remain queued and unsaved."""
+    engine = make_engine([
+        Extraction.model_validate({
+            "loan_amount_lakh": 40,
+        }),
+    ])
+
+    result = await engine.handle("I need forty lakh")
+
+    assert engine.state.property_type is None
+    assert engine.state.loan_amount_lakh is None
+    assert engine.pending_confirmation is not None
+    assert engine.pending_confirmation["field"] == "property_type"
+    assert any(
+        answer["field"] == "loan_amount_lakh"
+        and answer["value"] == 40
+        for answer in engine.pending_answers
+    )
+    assert engine.asked_field == "confirm_candidate"
+    assert "yes or no" in result.reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_queued_answer_is_updated_when_customer_corrects_it():
+    """A newer explicit value replaces an older queued value for the same field."""
+    engine = make_engine([
+        Extraction.model_validate({
+            "loan_amount_lakh": 40,
+        }),
+        Extraction.model_validate({
+            "loan_amount_lakh": 50,
+        }),
+    ])
+
+    await engine.handle("I need forty lakh")
+
+    assert engine.pending_confirmation is not None
+    assert engine.pending_confirmation["field"] == "property_type"
+    assert engine.state.loan_amount_lakh is None
+
+    await engine.handle("Actually, I need fifty lakh")
+
+    queued_amounts = [
+        answer["value"]
+        for answer in engine.pending_answers
+        if answer["field"] == "loan_amount_lakh"
+    ]
+
+    assert queued_amounts == [50]
+    assert engine.state.loan_amount_lakh is None
